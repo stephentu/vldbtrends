@@ -4,8 +4,13 @@ import sklearn
 import numpy as np
 import pdb
 
+import scipy.cluster
+import multiprocessing as mp
+import itertools as it
+import time
+
 from sklearn.cluster import KMeans
-from util import Canonicalizer
+#from util import Canonicalizer
 from collections import *
 import random
 import prettyplotlib as ppl
@@ -16,8 +21,160 @@ from prettyplotlib import plt
 # This is "import matplotlib as mpl" from the prettyplotlib library
 from prettyplotlib import mpl
 
+from microscopes.models import gp as gamma_poisson
+from microscopes.mixture.definition import model_definition
+from microscopes.cxx.common.rng import rng
+from microscopes.cxx.common.recarray.dataview import numpy_dataview
+from microscopes.cxx.common.scalar_functions import log_exponential
+from microscopes.cxx.mixture.model import initialize, bind, deserialize
+from microscopes.cxx.kernels import gibbs, slice
 
-def cluster_and_render(conf, dbname, outname="./text.html", nclusters=8):
+def algo(counts):
+    """
+    receives a [word x year] matrix of non-negative counts.
+
+    expected to return a list of assignment vectors
+    """
+
+def smooth(counts):
+    return np.array([[np.mean(c[i:i+3]) for i in xrange(len(c))] for c in counts])
+
+def smooth_ints(counts):
+    return np.round(smooth(counts)).astype(int)
+
+def scores(values):
+    return np.array([l / max(l) for l in values])
+
+def take_last_merge_strategy(assignments):
+    return assignments[-1]
+
+def kmeans_algo(nclusters):
+    def algo(counts):
+        data = scores(smooth(counts))
+        clusterer = KMeans(nclusters, n_init=30, init='k-means++')
+        clusterer.fit(data)
+        return [clusterer.labels_]
+    return algo
+
+# multiprocessing boilerplate we will get rid of eventually
+def _make_definition(N, D):
+    return model_definition(N, [gamma_poisson]*D)
+
+def _make_hparams(D):
+  hparams = {
+    y : {
+      'alpha': (log_exponential(1.), 1.),
+      'inv_beta': (log_exponential(0.1), 0.1),
+    }
+    for y in xrange(D)
+  }
+  return hparams
+
+def _revive(N, D, data, latent):
+    defn = _make_definition(N, D)
+    view = numpy_dataview(data)
+    latent = deserialize(defn, latent)
+    hparams = _make_hparams(D)
+    return defn, view, latent, hparams
+
+def _work(args):
+    (N, D), data, latent, iters = args
+    defn, view, latent, hparams = _revive(N, D, data, latent)
+    r = rng()
+    model = bind(latent, view)
+    for _ in xrange(iters):
+        gibbs.assign(model, r)
+        #slice.hp(model, r, hparams=hparams)
+    return latent.serialize()
+
+def mixturemodel_gamma_poisson(nchains=100, nitersperchain=1000):
+    def algo(counts):
+        data = smooth_ints(counts)
+        N, D = data.shape
+        latents = []
+        defn = _make_definition(N, D)
+        Y = np.array([tuple(y) for y in data], dtype=[('',np.int32)]*D)
+        view = numpy_dataview(Y)
+        r = rng()
+        for _ in xrange(nchains):
+            latent = initialize(defn, view, r=r)
+            latents.append(latent.serialize())
+        p = mp.Pool(processes=mp.cpu_count() * 2)
+        start_time = time.time()
+        infers = p.map_async(_work, [((N, D), Y, latent, nitersperchain) for latent in latents]).get(10000000)
+        print "inference took", (time.time() - start_time), "secs"
+        p.close()
+        p.join()
+        infers = [_revive(N, D, Y, infer)[2] for infer in infers]
+        assignments_samples = [s.assignments() for s in infers]
+        return assignments_samples
+    return algo
+
+def scipy_fcluster_merge_strategy(assignments):
+
+    # Z-matrix helpers
+    def groups(assignments):
+        cluster_map = {}
+        for idx, gid in enumerate(assignments):
+            lst = cluster_map.get(gid, [])
+            lst.append(idx)
+            cluster_map[gid] = lst
+        return tuple(sorted(map(tuple, cluster_map.values()), key=len, reverse=True))
+
+    def zmatrix(assignments_samples):
+        n = len(assignments_samples[0])
+        # should make sparse matrix
+        zmat = np.zeros((n, n), dtype=np.float32)
+        for assignments in assignments_samples:
+            clusters = groups(assignments)
+            for cluster in clusters:
+                for i, j in it.product(cluster, repeat=2):
+                    zmat[i, j] += 1
+        zmat /= float(len(assignments_samples))
+        return zmat
+
+    def reorder_zmat(zmat, order):
+        zmat = zmat[order]
+        zmat = zmat[:,order]
+        return zmat
+
+    def linkage(zmat):
+        assert zmat.shape[0] == zmat.shape[1]
+        zmat0 = np.array(zmat[np.triu_indices(zmat.shape[0], k=1)])
+        zmat0 = 1. - zmat0
+        return scipy.cluster.hierarchy.linkage(zmat0)
+
+    def ordering(l):
+        return np.array(scipy.cluster.hierarchy.leaves_list(l))
+
+    zmat = zmatrix(assignments)
+    li = linkage(zmat)
+
+    # diagnostic: draw z-matrix
+    indices = ordering(li)
+    plt.imshow(reorder_zmat(zmat, indices),
+           cmap=plt.cm.binary, interpolation='nearest')
+    plt.savefig("zmat-before.pdf")
+    plt.close()
+
+    fassignment = scipy.cluster.hierarchy.fcluster(li, 0.001)
+    clustering = groups(fassignment)
+    sorted_ordering = list(it.chain.from_iterable(clustering))
+
+    # draw post fcluster() ordered z-matrix
+    plt.imshow(reorder_zmat(zmat, sorted_ordering),
+           cmap=plt.cm.binary, interpolation='nearest')
+    plt.savefig("zmat-after.pdf")
+    plt.close()
+
+    return fassignment
+
+def cluster_and_render(conf,
+                       dbname,
+                       algo_fn=kmeans_algo(8),
+                       merge_fn=take_last_merge_strategy,
+                       outname="./text.html"):
+
   db = sqlite3.connect(dbname)
   r = db.execute("select min(year), max(year) from counts")
   minyear, maxyear = r.fetchone()
@@ -29,24 +186,29 @@ def cluster_and_render(conf, dbname, outname="./text.html", nclusters=8):
       l = vects[w]
       l[y] = c
 
-
     ret = []
+    words = []
     for w in vects:
       d = vects[w]
-      counts = [float(d.get(y, 0.)) for y in xrange(minyear, maxyear+1)]
-      smooth = []
-      for i in xrange(len(counts)):
-        smooth.append(np.mean(counts[i:i+3]))
-      ret.append([w] + smooth)
-    return np.array(ret)
+      counts = [d.get(y, 0) for y in xrange(minyear, maxyear+1)]
+      ret.append(counts)
+      words.append(w)
+    return words, np.array(ret)
 
+  words, counts = vectors()
 
-  vects = vectors()
-  clusterer = KMeans(nclusters, n_init=30, init='k-means++')
-  data = vects[:,1:].astype(float)
-  data = np.array([l / max(l) for l in data ])
-  clusterer.fit(data) # words x year
-  labels = clusterer.labels_
+  labels = merge_fn(algo_fn(counts))
+  vects = smooth(counts)
+  vects = np.array([[w] + list(v) for w, v in zip(words, vects)])
+  for v in vects[:10]:
+      print v
+
+  #clusterer = KMeans(nclusters, n_init=30, init='k-means++')
+  #data = vects[:,1:].astype(float)
+  #data = np.array([l / max(l) for l in data ])
+  #clusterer.fit(data) # words x year
+  #labels = clusterer.labels_
+
   xs = np.array(range(minyear, maxyear+1))
 
   imgs = []
@@ -88,23 +250,21 @@ def cluster_and_render(conf, dbname, outname="./text.html", nclusters=8):
     cluster = vects[idxs]
     cluster = sorted(cluster, key=lambda t: max(t[1:].astype(float)), reverse=True)
     cluster = filter(lambda l: sum(map(float, l[1:])) > 4, cluster)
-    if not len(cluster): continue
+    if len(cluster) < 10: continue
     cluster = np.array(cluster)
     words = cluster[:,0]
     words = list(words)
 
-    if 'crowd' in words:
-      data = cluster[:,1:].astype(float)
-      data = np.array([l / max(l) for l in data])
-      clusterer = KMeans(2)
-      clusterer.fit(data)
-      for newlabel in set(clusterer.labels_):
-        idxs = clusterer.labels_ == newlabel
-        subcluster = cluster[idxs]
-        add_content(subcluster, content, "%s-%s" % (label, newlabel))
-
-      continue
-
+    #if 'crowd' in words:
+    #  data = cluster[:,1:].astype(float)
+    #  data = np.array([l / max(l) for l in data])
+    #  clusterer = KMeans(2)
+    #  clusterer.fit(data)
+    #  for newlabel in set(clusterer.labels_):
+    #    idxs = clusterer.labels_ == newlabel
+    #    subcluster = cluster[idxs]
+    #    add_content(subcluster, content, "%s-%s" % (label, newlabel))
+    #  continue
 
     cluster = cluster[:10]
     add_content(cluster, content, label)
@@ -120,4 +280,9 @@ def cluster_and_render(conf, dbname, outname="./text.html", nclusters=8):
 
 if __name__ == '__main__':
 
-  cluster_and_render('sigmod', 'stats.db', './text.html')
+  cluster_and_render('sigmod_kmeans', 'stats.db', outname="./text_kmeans.html")
+
+  cluster_and_render('sigmod_mixturemodel_gp', 'stats.db',
+          algo_fn=mixturemodel_gamma_poisson(),
+          merge_fn=scipy_fcluster_merge_strategy,
+          outname="./text_mixturemodel_gp.html")
