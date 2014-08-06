@@ -24,11 +24,11 @@ from prettyplotlib import mpl
 
 from microscopes.models import gp as gamma_poisson, dm as dirichlet_multinomial
 from microscopes.mixture.definition import model_definition
-from microscopes.cxx.common.rng import rng
-from microscopes.cxx.common.recarray.dataview import numpy_dataview
-from microscopes.cxx.common.scalar_functions import log_exponential
-from microscopes.cxx.mixture.model import initialize, bind, deserialize
-from microscopes.cxx.kernels import gibbs, slice
+from microscopes.common.rng import rng
+from microscopes.common.recarray.dataview import numpy_dataview
+from microscopes.common.scalar_functions import log_exponential
+from microscopes.mixture.model import initialize, bind, deserialize
+from microscopes.kernels import gibbs, slice
 
 def algo(counts):
     """
